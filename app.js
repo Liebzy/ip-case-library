@@ -591,7 +591,7 @@ function openCompare(a, b) {
 }
 
 /* ==================== 编辑 ==================== */
-function openEdit(id, draft) {
+function openEdit(id, draft, after) {
   const c = draft || (id ? DB.cases.find(x => x.id === id) : null) || blankCase();
   const m = sheet(`
     <div class="row" style="margin-bottom:6px"><button class="btn sm gh" id="cl">返回</button>
@@ -654,8 +654,11 @@ function openEdit(id, draft) {
       tags: g('#e-tags').split(/[,，]/).map(s => s.trim()).filter(Boolean)
     };
     o.focus = o.issue; o.brief = (o.facts || o.issue || '').slice(0, 30);
+    // 表单里没有、但必须跟着走的字段：附件、核实状态、来源材料
+    o.files = c.files || []; o.verified = !!c.verified; o.src = c.src || ''; o.note = c.note || '';
     if (id) { Object.assign(DB.cases.find(x => x.id === id), o, { updatedAt: Date.now() }); }
-    else { DB.cases.unshift({ id: uid(), ...o, files: [], createdAt: Date.now(), updatedAt: Date.now() }); }
+    else if (after) { m.remove(); after(o); return; }
+    else { DB.cases.unshift({ id: uid(), ...o, createdAt: Date.now(), updatedAt: Date.now() }); }
     save(); m.remove(); render(); toast('已保存');
   };
 }
@@ -860,11 +863,27 @@ function jsonOf(s) {
   if (m) { try { return JSON.parse(m[0]); } catch (e) { } }
   return null;
 }
-const FIELD_RULE = `   obj 取值限定：专利/商标/著作权/商业秘密/不正当竞争/数据知识产权/集成电路布图/植物新品种/地理标志/域名/其他
-   biz 限定：诉讼/非诉/合规/风控/咨询/交易/监管应对/其他
-   nat 限定：侵权/权属/合同/许可/无效撤销/垄断/不正当竞争/其他
-   res 限定：胜诉/败诉/部分支持/调解/撤诉/整改结案/未决
-   amt 限定：100万以下/100万-1000万/1000万-1亿/1亿以上/未披露`;
+const FIELD_RULE = `   以下字段必须严格从给定值里选一个，不许自造（例如行业只能写「通信」，不能写「通信/5G」）：
+   obj：专利/商标/著作权/商业秘密/不正当竞争/数据知识产权/集成电路布图/植物新品种/地理标志/域名/其他
+   biz：诉讼/非诉/合规/风控/咨询/交易/监管应对/其他
+   nat：侵权/权属/合同/许可/无效/撤销/垄断/不正当竞争/其他
+   stg：行政程序/一审/二审/再审/执行/仲裁/刑事/协商和解
+   ind：互联网/AI/通信/医药/文娱/智能制造/消费品/汽车/金融/教育/其他
+   res：胜诉/败诉/部分支持/调解/撤诉/整改结案/未决
+   amt：100万以下/100万-1000万/1000万-1亿/1亿以上/未披露`;
+
+/* 兜底：模型偶尔会自造取值（如「通信/5G」），这里拉回合法选项，拉不回就留空 */
+function fixEnum(c) {
+  ['obj', 'biz', 'nat', 'stg', 'ind', 'res', 'amt'].forEach(k => {
+    const v = String(c[k] == null ? '' : c[k]).trim();
+    if (!v) return;
+    const opts = DIM[k].opts;
+    if (opts.includes(v)) return;
+    c[k] = opts.find(o => v.includes(o) || o.includes(v)) || '';
+  });
+  if (Array.isArray(c.refs)) c.refs = c.refs.join('；');
+  return c;
+}
 
 /* 第一步：从材料里认出提到的每个案子 */
 async function aiBatch(text, source, files) {
@@ -893,7 +912,12 @@ async function aiBatch(text, source, files) {
     ], null, { t: 0.1 });
     const j = jsonOf(raw);
     const arr = j ? (j.items || (Array.isArray(j) ? j : null)) : null;
-    items = (arr || []).filter(x => x && x.name).slice(0, 20);
+    const seen = new Set();
+    items = (arr || []).filter(x => {
+      const k = String(x.name || '').trim();
+      if (!k || seen.has(k)) return false;
+      seen.add(k); return true;
+    }).slice(0, 20);
   } catch (e) {
     m.remove(); bail('读材料失败：' + e.message); return;
   }
@@ -936,9 +960,9 @@ async function enrichLoop(picked, SRC, source, files, tag) {
   const m = sheet(`<h3>逐个补全</h3><p class="sub" id="st">准备中…</p>
     <div class="card" style="padding:14px"><span class="spin"></span> <span class="muted">每补完一条就往下列一条</span></div>
     <div id="box"></div>
-    <div style="height:10px"></div><button class="btn wide gh" id="cl">放弃</button>`);
-  m.querySelector('#cl').onclick = () => m.remove();
+    <div style="height:10px"></div><button class="btn wide gh" id="cl">停下，保留已补完的</button>`);
   const box = m.querySelector('#box'), st = m.querySelector('#st');
+  m.querySelector('#cl').onclick = () => { m.remove(); reviewCases(out, files, source); };
   const out = [];
   for (let i = 0; i < picked.length; i++) {
     const it = picked[i];
@@ -985,6 +1009,7 @@ ${FIELD_RULE}
     files: files || []
   };
   c.tags = Array.isArray(j.tags) ? j.tags : [];
+  fixEnum(c);
   if (j.uncertain && j.uncertain.length) c.takeaway = (c.takeaway || '') + '\n【待核实】' + j.uncertain.join('；');
   c.brief = (c.facts || c.issue || '').slice(0, 30);
   c.focus = c.issue;
@@ -1015,7 +1040,8 @@ function reviewCases(list, files, source) {
     m.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { list.splice(+b.dataset.rm, 1); draw(); });
     m.querySelectorAll('[data-ed]').forEach(b => b.onclick = () => {
       const i = +b.dataset.ed; m.remove();
-      openEdit(null, list[i]);
+      // 改完回到这一屏，剩下的条目还在，不会被丢掉
+      openEdit(null, list[i], o => { list[i] = { ...list[i], ...o }; reviewCases(list, files, source); });
     });
   };
   const m = sheet(`<h3>补完了</h3><p class="sub">看一眼，不要的删掉，要细改的点「改」</p>
@@ -1027,10 +1053,9 @@ function reviewCases(list, files, source) {
   m.querySelector('#sv').onclick = () => {
     const ok = list.filter(x => !x.__err);
     if (!ok.length) { m.remove(); return; }
-    ok.forEach(c => {
-      DB.cases.unshift({ id: uid(), ...c, createdAt: Date.now(), updatedAt: Date.now() });
-    });
-    save(); m.remove(); render();
+    // 一次性展开，保证入库顺序跟列表一致（逐条 unshift 会倒过来）
+    DB.cases.unshift(...ok.map(c => ({ id: uid(), ...c, createdAt: Date.now(), updatedAt: Date.now() })));
+    save(); m.remove(); go('lib');
     toast(`已加入 ${ok.length} 条，案号待核实`);
   };
 }
